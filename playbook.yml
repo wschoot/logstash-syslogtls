@@ -1,0 +1,347 @@
+---
+- hosts: logstash
+  connection: local
+  vars:
+    certificates:
+      country: NL
+      organization: ACME corp
+      organizationalunit: ACME corp Unified Platform
+      keyalgo: rsa
+      keysize: 2048
+    cfssl_server_ca_generated_config:
+      cn: "Automatic Generated CA"
+      algo: rsa # Optional, default rsa
+      size: 2048 # Optional, default 2048
+      country: NL
+      organization: ACME corp
+      organizationalunit: ACME corp Unified Platform
+    caconfig:
+      signing:
+        default:
+          expiry: 262800h
+        profiles:
+          client:
+            expiry: 43800h
+            usages:
+            - signing
+            - key encipherment
+            - client auth
+          intermediate:
+            ca_constraint:
+              is_ca: true
+              max_path_len: 1
+            expiry: 262800h
+            usages:
+            - digital signature
+            - signing
+            - key encipherment
+            - cert sign
+            - crl sign
+          server:
+            expiry: 43800h
+            usages:
+            - signing
+            - key encipherment
+            - client auth
+            - server auth
+
+  tasks:
+  - name: set vars between plays
+    set_fact:
+      log: /home/vagrant/output
+      servername:
+        - "{{ inventory_hostname }}"
+
+  - name: Download cfssl
+    get_url:
+      url: https://github.com/cloudflare/cfssl/releases/download/v1.4.1/cfssl_1.4.1_linux_amd64
+      checksum: sha256:d01a26bc88851aab4c986e820e7b3885cedf1316a9c26a98fbba83105cfd7b87
+      dest: "$PWD/cfssl"
+      mode: u+rwx
+
+  - name: Create CA CSR
+    copy:
+      dest: ca-csr.json
+      content: |
+        {
+          "CN": "{{ cfssl_server_ca_generated_config.cn }}",
+          "key": {
+            "algo": "{{ cfssl_server_ca_generated_config.algo | default('rsa') }}",
+            "size": {{ cfssl_server_ca_generated_config.size | default('2048') }}
+          },
+          "names": [
+            {
+              "C": "{{ cfssl_server_ca_generated_config.country }}",
+              "O": "{{ cfssl_server_ca_generated_config.organization }}",
+              "OU": "{{ cfssl_server_ca_generated_config.organizationalunit }}"
+            }
+          ]
+        }
+
+  - name: Generate CA CSR
+    changed_when: false
+    command: "$PWD/cfssl genkey -initca ca-csr.json"
+    register: cfssl
+
+  - name: Save CA cert
+    copy:
+      content: "{{ (cfssl.stdout_lines[0]|from_json).cert }}"
+      dest: ca-cert.pem
+
+  - name: Save CA key
+    copy:
+      content: "{{ (cfssl.stdout_lines[0]|from_json).key }}"
+      mode: 0400
+      dest: ca-key.pem
+
+  - name: Set ca config
+    copy:
+      dest: ca-config.json
+      mode: 0444
+      content: "{{ caconfig|to_nice_json }}"
+
+  - name: Create certificate CSR
+    copy:
+      dest: "{{ item }}-csr.json"
+      content: |
+        {
+          "hosts": [ {{ item | list | join | to_nice_json(indent=8) }} ],
+          "CN": "{{ item }}",
+          "key": {
+              "algo": "{{ certificates.keyalgo }}",
+              "size": {{ certificates.keysize }}
+          },
+          "names": [{
+              "C": "{{ certificates.country }}",
+              "O": "{{ certificates.organization }}",
+              "OU": "{{ certificates.organizationalunit }}"
+          }]
+        }
+    with_items: "{{ groups['all'] }}"
+
+  - name: Generate server cert
+    changed_when: false
+    command: >
+      ./cfssl
+      gencert
+      -ca=ca-cert.pem
+      -ca-key=ca-key.pem
+      -config=ca-config.json
+      -profile=server
+      logstash-csr.json
+    register: servercert
+
+  - name: Generate client cert
+    changed_when: false
+    command: >
+      ./cfssl
+      gencert
+      -ca=ca-cert.pem
+      -ca-key=ca-key.pem
+      -config=ca-config.json
+      -profile=client
+      syslog-csr.json
+    register: clientcert
+
+  # Make sure the next plays can access these vars as well
+  # using this host hostsvars
+  - name: set facts to be used later
+    set_fact:
+      clientcert: "{{ clientcert }}"
+      servercert: "{{ servercert }}"
+      cfssl: "{{ cfssl }}"
+
+  - name: remove abundant files
+    file:
+      state: absent
+      name: "{{ item }}"
+    loop:
+    - ca-cert.pem
+    - ca-config.json
+    - ca-csr.json
+    - ca-key.pem
+    - logstash-csr.json
+    - syslog-csr.json
+
+- hosts: logstash
+  become: true
+  tasks:
+  - name: Setup repository
+    yum_repository:
+      name: logstash-7.x
+      description: Elastic repository for 7.x packages
+      baseurl: https://artifacts.elastic.co/packages/7.x/yum
+      gpgcheck: yes
+      metadata_expire_filter: read-only:future
+      gpgkey: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+
+  - name: installs packages
+    package:
+      name:
+      - logstash
+      - epel-release
+      - filebeat
+      - elasticsearch
+      - kibana
+      - tmux
+      - java-11-openjdk-headless
+      - vim
+      - tcpdump
+      state: present
+
+  - name: Copy ca
+    copy:
+      content: "{{ (cfssl.stdout_lines[0]|from_json).cert }}"
+      dest: "/etc/logstash/ca-cert.pem"
+
+  - name: Copy cert
+    copy:
+      content: "{{ (servercert.stdout_lines[0]|from_json).cert }}"
+      dest: "/etc/logstash/{{ inventory_hostname }}-cert.pem"
+
+  - name: Copy key
+    copy:
+      content: "{{ (servercert.stdout_lines[0]|from_json).key }}"
+      dest: "/etc/logstash/{{ inventory_hostname }}-key.pem"
+
+  - name: Create kibana config
+    lineinfile:
+      dest: /etc/kibana/kibana.yml
+      line: "server.host: \"{{ hostvars['logstash']['ansible_default_ipv4']['address'] }}\""
+
+  - name: Create pipeline
+    become: true
+    copy:
+      dest: /etc/logstash/conf.d/local-logstash.conf
+      content: |
+        input {
+          tcp {
+            port => 10514
+            ssl_enable => true
+            ssl_certificate_authorities => ["/etc/logstash/ca-cert.pem"]
+            ssl_cert => "/etc/logstash/logstash-cert.pem"
+            ssl_key => "/etc/logstash/logstash-key.pem"
+            ssl_verify => true
+          }
+        }
+        output {
+          file {
+            path => "{{ log }}"
+          }
+          elasticsearch {
+            hosts => [ "localhost:9200" ]
+          }
+        }
+
+  - name: start elasticsearch
+    become: true
+    systemd:
+      name: "{{ item }}"
+      state: restarted
+    loop:
+    - elasticsearch
+    - kibana
+
+  - name: Start logstash
+    shell: |
+      tmux new-session -d -s logstash &&
+      tmux set-option remain-on-exit on &&
+      tmux new-window '/usr/share/logstash/bin/logstash -f /etc/logstash/conf.d/local-logstash.conf --config.reload.automatic' \; split-window 'tcpdump -s0 -A dst port 10514' \; split-window 'tail -F {{ log }}'
+    ignore_errors: true
+
+  - name: Create motd
+    become: true
+    copy:
+      dest: /etc/motd
+      content: |
+        TERMINAL:
+          sudo -s -- tmux at
+        WEB:
+          http://{{ hostvars['logstash']['ansible_default_ipv4']['address'] }}:5601/app/kibana
+          -> Explore on my own
+          Use Elasticsearch data -> Connect to your Elasticsearch index
+          -> Create index pattern
+          '*' -> Next Step
+          '@timestamp' -> Create index pattern
+          http://{{ hostvars['logstash']['ansible_default_ipv4']['address'] }}:5601/app/discover
+
+
+
+- hosts: syslog
+  become: true
+  tasks:
+  - name: disable SElinux
+    selinux:
+      state: permissive
+      policy: targeted
+
+  - name: Install packages
+    package:
+      name:
+      - rsyslog-gnutls # Voor /usr/lib64/rsyslog/lmnsd_gtls.so
+      - vim
+      - tcpdump
+      state: present
+
+  - name: Copy ca
+    copy:
+      content: "{{ (hostvars['logstash'].cfssl.stdout_lines[0]|from_json).cert }}"
+      dest: "/home/vagrant/ca-cert.pem"
+
+  - name: Copy cert
+    copy:
+      content: "{{ (hostvars['logstash'].clientcert.stdout_lines[0]|from_json).cert }}"
+      dest: "/home/vagrant/{{ inventory_hostname }}-cert.pem"
+
+  - name: Copy key
+    copy:
+      content: "{{ (hostvars['logstash'].clientcert.stdout_lines[0]|from_json).key }}"
+      dest: "/home/vagrant/{{ inventory_hostname }}-key.pem"
+
+  - name: Add host
+    lineinfile:
+      dest: /etc/hosts
+      line: "{{ hostvars['logstash']['ansible_default_ipv4']['address'] }} {{ hostvars['logstash'].servername[0] }}"
+
+  - name: rsyslog config
+    blockinfile:
+      path: /etc/rsyslog.conf
+      block: |
+        global(
+          DefaultNetstreamDriver="gtls"
+          DefaultNetstreamDriverCAFile="/home/vagrant/ca-cert.pem"
+          DefaultNetstreamDriverCertFile="/home/vagrant/{{ inventory_hostname }}-cert.pem"
+          DefaultNetstreamDriverKeyFile="/home/vagrant/{{ inventory_hostname }}-key.pem"
+        )
+
+        action(
+          type="omfwd"
+          protocol="tcp"
+          port="10514"
+          target="{{ hostvars['logstash'].servername[0] }}"
+          StreamDriver="gtls"
+          StreamDriverMode="1"
+          StreamDriverAuthMode="x509/name"
+          StreamDriverPermittedPeers="{{ hostvars['logstash'].servername[0] }}"
+        )
+
+  - name: Send a log every minute
+    cron:
+      name: logger
+      user: root
+      job: logger $(date)
+
+  - name: restart rsyslog
+    systemd:
+      name: rsyslog
+      state: restarted
+
+  - debug:
+      msg:
+        - "http://{{ hostvars['logstash']['ansible_default_ipv4']['address'] }}:5601/app/kibana"
+        - "-> Explore on my own"
+        - "Use Elasticsearch data -> Connect to your Elasticsearch index"
+        - "-> Create index pattern"
+        - "'*' -> Next Step"
+        - "'@timestamp' -> Create index pattern"
+        - "http://{{ hostvars['logstash']['ansible_default_ipv4']['address'] }}:5601/app/discover"
